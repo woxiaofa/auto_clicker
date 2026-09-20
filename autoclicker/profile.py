@@ -107,6 +107,7 @@ class Settings:
     mouse_duration: float = 0.05  # 鼠标移动时长
     failsafe: bool = True         # 鼠标移到屏幕左上角急停
     require_window: bool = False  # 目标窗口不在前台时是否暂停等待
+    auto_focus: bool = True       # 开始前自动把目标窗口切到前台（配合上面的 target_window）
     dry_run: bool = False         # 空跑：只打日志不真的操作
     log_to_file: bool = True
     log_file: str = "logs/run.log"

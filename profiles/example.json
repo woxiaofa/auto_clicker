@@ -10,6 +10,7 @@
     "mouse_duration": 0.05,
     "failsafe": true,
     "require_window": false,
+    "auto_focus": true,
     "dry_run": false,
     "log_to_file": true,
     "log_file": "logs/run.log",

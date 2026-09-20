@@ -34,6 +34,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--countdown", type=float, default=None, help="开始前倒计时秒数")
     p.add_argument("--dry-run", action="store_true", help="空跑：只打印日志，不操作鼠标键盘")
     p.add_argument("--target-window", default=None, help="目标窗口标题（包含匹配）")
+    p.add_argument("--require-window", action="store_true",
+                   help="目标窗口不在前台时暂停等待，而不是带警告继续")
+    p.add_argument("--no-auto-focus", action="store_true",
+                   help="禁止开始时自动把目标窗口切到前台（抢焦点可能影响无人值守脚本）")
     p.add_argument("--no-hotkey", action="store_true", help="不注册全局热键")
     p.add_argument("--list-steps", action="store_true", help="只列出步骤然后退出")
     p.add_argument("--create-example", metavar="PATH", help="生成一份示例配置并退出")
@@ -87,6 +91,10 @@ def main(argv=None) -> int:
         profile.settings.dry_run = True
     if args.target_window:
         profile.settings.target_window = args.target_window
+    if args.require_window:
+        profile.settings.require_window = True
+    if args.no_auto_focus:
+        profile.settings.auto_focus = False
 
     if args.list_steps:
         print(f"任务：{profile.name}（共 {len(profile.steps)} 步）")

@@ -3,13 +3,15 @@
 界面分区：
 1. 工具栏       —— 新建 / 打开 / 保存 配置
 2. 步骤列表     —— 增删改、上下移动、复制
-3. 任务设置     —— 循环、倒计时、目标窗口、抖动、空跑等
+3. 任务设置     —— 循环、倒计时、目标窗口（下拉 / 点选）、抖动、空跑等
 4. 运行控制     —— 开始 / 暂停 / 停止，实时状态
 5. 日志面板     —— 彩色分级输出
 
-两个屏幕拾取器（替代原来的三条 Python 小脚本）：
+三个屏幕拾取器（替代原来的三条 Python 小脚本）：
 - **坐标拾取**：半透明全屏浮层跟随鼠标显示坐标，空格或点击即锁定
 - **区域截图**：全屏拖拽框选，自动生成模板图片，供“等待图片”步骤使用
+- **窗口点选**：鼠标移过哪个窗口就高亮它的标题与边框，单击即填进“目标窗口”，
+  免去手打标题；「列表」按钮则把桌面所有可见窗口灌进下拉框
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from typing import List, Optional
 from . import profile as pm
 from .engine import Engine
 from .platform_adapter import (
+    SYSTEM,
     DependencyStatus,
     Grabber,
     WindowTools,
@@ -38,6 +41,7 @@ except Exception:
     _keyboard = None
 
 ACCENT = "#3b6fd4"
+APP_TITLE = "自动点击器 Auto Clicker · 可视化配置"
 LOG_COLORS = {"info": "#222222", "warn": "#b8860b", "error": "#c0392b", "success": "#1e8449"}
 
 
@@ -102,8 +106,8 @@ class CoordinatePicker(tk.Toplevel):
 
     def _on_motion(self, event=None) -> None:
         # 统一以屏幕实际指针为准，避免轮询时用伪造事件覆盖真实坐标
-        px, py = self.winfo_pointerxy()
-        self._last = (px, py)
+        x, y = self.winfo_pointerxy()
+        self._last = (x, y)
         w, h = 120, 26
         self.canvas.coords(self.cross_v, x, 0, x, self.winfo_screenheight())
         self.canvas.coords(self.cross_h, 0, y, self.winfo_screenwidth(), y)
@@ -132,6 +136,150 @@ class CoordinatePicker(tk.Toplevel):
             self.result = tuple(pag.position())
         except Exception:
             self.result = getattr(self, "_last", None)
+        self._close()
+
+    def _close(self) -> None:
+        try:
+            self.grab_release()
+        except Exception:
+            pass
+        self.destroy()
+
+
+class WindowPicker(tk.Toplevel):
+    """半透明全屏浮层：鼠标移到哪个窗口上就高亮它标题，单击 / 空格选中，Esc 取消。
+
+    关键在于「排除自身」——浮层盖在最上层，命中检测时要把自己的 hwnd / 标题
+    从 Z 序结果里剔除，否则选中的永远是浮层本身。
+    """
+
+    POLL_MS = 90
+
+    def __init__(self, master) -> None:
+        super().__init__(master)
+        self.result = None  # Optional[WindowInfo]
+        self.tools = WindowTools()
+
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        try:
+            self.attributes("-alpha", 0.30)
+        except Exception:
+            pass
+        self.title("__autoclicker_window_picker__")
+        self.configure(bg="#0b1d3a", cursor="crosshair")
+        self.geometry(self._virtual_geometry())
+
+        self.canvas = tk.Canvas(self, bg="#0b1d3a", highlightthickness=0, cursor="crosshair")
+        self.canvas.pack(fill="both", expand=True)
+
+        sw = self.winfo_screenwidth()
+        self.canvas.create_text(
+            sw // 2, 40,
+            text="把鼠标移到目标窗口上 —— 单击或按【空格】选中，【Esc】取消",
+            fill="#ffffff", font=("Microsoft YaHei", 15, "bold"),
+        )
+        self.hint_secondary = self.canvas.create_text(
+            sw // 2, 68, text="", fill="#ffd479", font=("Microsoft YaHei", 11),
+        )
+
+        self.hl = self.canvas.create_rectangle(0, 0, 0, 0, outline="#ff4d4f", width=3)
+        self.tag_bg = self.canvas.create_rectangle(0, 0, 0, 0, fill="#111827", outline="#ff4d4f")
+        self.tag = self.canvas.create_text(0, 0, text="", fill="#ffffff",
+                                           font=("Consolas", 11, "bold"))
+
+        self.bind("<Button-1>", lambda e: self._confirm())
+        self.bind("<KeyPress-space>", lambda e: self._confirm())
+        self.bind("<KeyPress-Escape>", lambda e: self._close())
+        self.protocol("WM_DELETE_WINDOW", self._close)
+        self.focus_force()
+        self.grab_set()
+
+        self._current = None
+        self.update_idletasks()
+        self._self_hwnd = self._resolve_hwnd()
+        self._tick()
+
+    # ---------------------------------------------------------------- 内部
+
+    def _virtual_geometry(self) -> str:
+        """覆盖整个虚拟桌面（多显示器时可能带负坐标）。"""
+        try:
+            g = Grabber()
+            img, (ox, oy) = g.grab()
+            scale = g.measure_scale()
+            return f"{int(img.width / scale)}x{int(img.height / scale)}+{ox}+{oy}"
+        except Exception:
+            return f"{self.winfo_screenwidth()}x{self.winfo_screenheight()}+0+0"
+
+    def _resolve_hwnd(self) -> int:
+        """拿到本浮层真正的HWND——``winfo_id()`` 在某些平台上给的是子窗口句柄。"""
+        if SYSTEM != "Windows":
+            return 0
+        try:
+            import ctypes
+
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            return int(hwnd) if hwnd else int(self.winfo_id())
+        except Exception:
+            return 0
+
+    def _tick(self) -> None:
+        if not self.winfo_exists():
+            return
+        try:
+            x, y = self.winfo_pointerxy()
+            info = self.tools.window_at_point(
+                x, y,
+                exclude_handle=self._self_hwnd,
+                exclude_title="__autoclicker_window_picker__",
+            )
+            self._current = info
+            self._paint(info)
+        except Exception:
+            pass
+        self.after(self.POLL_MS, self._tick)
+
+    def _paint(self, info) -> None:
+        origin_x, origin_y = self._geometry_origin()
+        if info is None:
+            self.canvas.coords(self.hl, 0, 0, 0, 0)
+            self.canvas.coords(self.tag_bg, 0, 0, 0, 0)
+            self.canvas.coords(self.tag, 0, 0)
+            self.canvas.itemconfig(self.hint_secondary, text="未检测到窗口（该平台可能不支持窗口枚举）")
+            return
+
+        left = info.left - origin_x
+        top = info.top - origin_y
+        right = left + info.width
+        bottom = top + info.height
+        self.canvas.coords(self.hl, left, top, right, bottom)
+
+        text = info.display(52)
+        # 标签画在高亮框上沿的外侧，越界时翻到框内，保证始终可见
+        tw = min(560, 14 + len(text) * 8)
+        lx = max(2, min(left + 2, self.winfo_screenwidth() - tw - 4))
+        ly = top - 26 if top - 26 > 2 else top + 4
+        self.canvas.coords(self.tag_bg, lx, ly, lx + tw, ly + 24)
+        self.canvas.coords(self.tag, lx + 6, ly + 12)
+        self.canvas.itemconfig(self.tag, text=text, anchor="w")
+        self.canvas.itemconfig(
+            self.hint_secondary,
+            text=f"位置 {info.left},{info.top} · 尺寸 {info.width}×{info.height}",
+        )
+
+    def _geometry_origin(self):
+        """浮层左上角在第一块虚拟屏幕坐标系里的位置，用于把屏幕坐标换算成画布坐标。"""
+        g = self.geometry()  # 形如 "宽x高+x+y"
+        try:
+            offset = g.split("+", 1)[1]
+            ox, oy = (int(v) for v in offset.split("+"))
+            return ox, oy
+        except Exception:
+            return 0, 0
+
+    def _confirm(self) -> None:
+        self.result = self._current
         self._close()
 
     def _close(self) -> None:
@@ -411,7 +559,7 @@ class App:
 
     def __init__(self, root: tk.Tk, profile_path: Optional[str] = None) -> None:
         self.root = root
-        self.root.title("自动点击器 Auto Clicker · 可视化配置")
+        self.root.title(APP_TITLE)
         self.root.geometry("1000x680")
         self.root.minsize(900, 620)
 
@@ -492,10 +640,12 @@ class App:
         self.v_countdown = tk.DoubleVar(value=3.0)
         self.v_target = tk.StringVar()
         self.v_require = tk.BooleanVar(value=False)
+        self.v_autofocus = tk.BooleanVar(value=True)
         self.v_failsafe = tk.BooleanVar(value=True)
         self.v_jitter = tk.DoubleVar(value=0.0)
         self.v_interval = tk.DoubleVar(value=0.05)
         self.v_dry = tk.BooleanVar(value=False)
+        self._window_catalog: List[str] = []  # 最近一次枚举到的窗口标题
 
         r = 0
         ttk.Label(box, text="任务名").grid(row=r, column=0, sticky="e", pady=3)
@@ -510,10 +660,18 @@ class App:
                     width=6).grid(row=r, column=1, sticky="w")
         r += 1
         ttk.Label(box, text="目标窗口标题").grid(row=r, column=0, sticky="e")
-        ttk.Entry(box, textvariable=self.v_target, width=26).grid(row=r, column=1, sticky="w")
-        ttk.Button(box, text="取当前", command=self._capture_active_window).grid(row=r, column=2, padx=4)
+        self.cmb_target = ttk.Combobox(box, textvariable=self.v_target, width=24)
+        self.cmb_target.grid(row=r, column=1, sticky="w")
+        # 手动输入的标题也能生效，下拉只是省去手打：Combobox 本来就是两者兼容的
+        pick_row = ttk.Frame(box)
+        pick_row.grid(row=r, column=2, sticky="w", padx=4)
+        ttk.Button(pick_row, text="点选", width=5, command=self._pick_window).pack(side="left")
+        ttk.Button(pick_row, text="列表", width=5, command=self._refresh_windows).pack(side="left", padx=2)
         r += 1
         ttk.Checkbutton(box, text="窗口不在前台时等待", variable=self.v_require).grid(
+            row=r, column=0, columnspan=2, sticky="w")
+        r += 1
+        ttk.Checkbutton(box, text="开始前自动切到目标窗口", variable=self.v_autofocus).grid(
             row=r, column=0, columnspan=2, sticky="w")
         r += 1
         ttk.Checkbutton(box, text="左上角急停（推荐）", variable=self.v_failsafe).grid(
@@ -571,6 +729,7 @@ class App:
         st.countdown = float(self.v_countdown.get())
         st.target_window = self.v_target.get().strip()
         st.require_window = bool(self.v_require.get())
+        st.auto_focus = bool(self.v_autofocus.get())
         st.failsafe = bool(self.v_failsafe.get())
         st.jitter = float(self.v_jitter.get())
         st.min_interval = float(self.v_interval.get())
@@ -584,6 +743,7 @@ class App:
         self.v_countdown.set(float(getattr(st, "countdown", 3.0)))
         self.v_target.set(getattr(st, "target_window", ""))
         self.v_require.set(bool(getattr(st, "require_window", False)))
+        self.v_autofocus.set(bool(getattr(st, "auto_focus", True)))
         self.v_failsafe.set(bool(getattr(st, "failsafe", True)))
         self.v_jitter.set(float(getattr(st, "jitter", 0.0)))
         self.v_interval.set(float(getattr(st, "min_interval", 0.05)))
@@ -752,12 +912,67 @@ class App:
         self.btn_pause.config(state="disabled")
         self.btn_stop.config(state="disabled")
 
-    def _capture_active_window(self) -> None:
-        title = WindowTools().active_title()
-        if title:
-            self.v_target.set(title)
+    # ---------------------------------------------------------------- 目标窗口
+
+    def _require_window_tools(self) -> Optional[WindowTools]:
+        """窗口能力不可用时给出明确提示，而不是静默失败。"""
+        tools = WindowTools()
+        if tools.backend == "none":
+            messagebox.showinfo(
+                "不支持窗口枚举",
+                "当前平台没有可用的窗口检测后端（win32gui 或 pygetwindow）。\n"
+                "你可以直接在输入框里手填目标窗口标题，或安装依赖：pip install pygetwindow",
+            )
+            return None
+        return tools
+
+    def _refresh_windows(self) -> None:
+        """把桌面上可见的窗口标题灌进下拉框，省得手打。"""
+        tools = self._require_window_tools()
+        if tools is None:
+            return
+        seen, picked = set(), {}
+        for info in tools.list_windows():
+            title = info.title.strip()
+            if not title or title == APP_TITLE:
+                continue
+            # 同一标题保留面积最大的那个（通常是真正的目标窗口）
+            key = title.lower()
+            if key not in picked or info.area > picked[key].area:
+                picked[key] = info
+        titles = [v.title for _, v in sorted(picked.items(), key=lambda kv: -kv[1].area)]
+        self._window_catalog = titles
+        self.cmb_target["values"] = titles
+        if titles:
+            self.cmb_target.focus_set()
+            self.cmb_target.event_generate("<Down>")  # 展开下拉，结果直接可见
+            self._log_ui(f"已列出 {len(titles)} 个桌面窗口，点击即可选中", "info")
         else:
-            messagebox.showinfo("提示", "未能读取前台窗口标题（当前平台可能不支持窗口检测）")
+            messagebox.showinfo("没有可用窗口", "没有枚举到任何带标题的可见窗口，请改用「点选」。")
+
+    def _pick_window(self) -> None:
+        """鼠标移到哪个窗口上就选哪个——不必手打标题。"""
+        if self._require_window_tools() is None:
+            return
+        self.root.iconify()  # 主窗口先收起，避免挡住目标窗口
+        self.root.after(160, lambda: None)
+        picker = WindowPicker(self.root)
+        try:
+            self.root.wait_window(picker)
+        finally:
+            self.root.deiconify()
+        info = picker.result
+        if info is None:
+            return
+        if not info.title.strip():
+            messagebox.showwarning(
+                "该窗口没有标题",
+                "这个窗口读不到标题文本，无法按标题匹配。\n"
+                "建议改用「绝对坐标」模式，或换一个窗口试试。",
+            )
+            return
+        self.v_target.set(info.title.strip())
+        self._log_ui(f"已选择目标窗口：{info.title}（{info.width}×{info.height}）", "success")
 
     # ---------------------------------------------------------------- 热键 / 日志
     def _register_hotkeys(self) -> None:

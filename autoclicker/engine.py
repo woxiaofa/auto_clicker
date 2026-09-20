@@ -132,6 +132,8 @@ class Engine:
             if self.stop_event.is_set():
                 return
 
+            self._focus_target_window()  # 倒计时刚结束，此时切窗口不会打断用户操作
+
             self._status("运行中")
             self.log(f"任务开始：{self.profile.name}（{SYSTEM}，后端={'空跑' if st.dry_run else '真实执行'}）")
 
@@ -347,6 +349,28 @@ class Engine:
             self.log(msg, "error")
 
     # ------------------------------------------------------------ 辅助
+    def _focus_target_window(self) -> None:
+        """任务开始的第一件事：把目标窗口请到前台。
+
+        放在这里而不是每个动作前，一是省去频繁枚举，二是此刻用户刚好松手，
+        抢焦点不会打断他的操作。切换失败时不中断任务——由 ``_guard_window``
+        按 require_window 决定是等待还是带警告继续。
+        """
+        st = self.profile.settings
+        title = (st.target_window or "").strip()
+        if not title or not getattr(st, "auto_focus", True):
+            return
+        if st.dry_run:
+            self.log(f"[空跑] 已跳过自动切换到窗口：{title}", "info")
+            return
+        if self.windows.is_title_active(title):
+            return
+        ok, why = self.windows.activate(title)
+        if ok:
+            self.log(f"已自动切换到目标窗口：{title}", "success")
+        else:
+            self.log(f"未能自动切换到“{title}”：{why or '未知原因'}，请手动点击该窗口", "warn")
+
     def _guard_window(self) -> None:
         """目标窗口校验：不在前台则按 require_window 决定等待还是继续。"""
         st = self.profile.settings
@@ -358,6 +382,8 @@ class Engine:
                 return
             self.log(f"当前前台窗口不是“{title}”", "warn")
             if not st.require_window:
+                # 明确说出来，避免用户以为已经自动切好了
+                self.log("目标窗口不在前台且未开启等待，操作仍会作用在当前的窗口上", "warn")
                 break
             self._status(f"等待窗口：{title}")
             waited = 0.0

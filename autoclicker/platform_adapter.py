@@ -6,8 +6,14 @@
 组成部分：
 - ``enable_dpi_awareness()``   Windows 打开进程级 DPI 感知，消除坐标与截图的错位
 - ``Grabber``                  优先用 mss 截取整个虚拟屏幕（含副屏负坐标），失败则退回 pyautogui
-- ``WindowTools``              前台窗口检测：win32gui → pygetwindow → 不可用则返回 None
+- ``WindowTools``              窗口枚举 / 命中检测：win32gui → pygetwindow → 不可用则返回空列表
 - ``deps`` / ``locate()``      依赖探测与模板匹配，无 OpenCV 时自动退回像素级精确匹配
+
+``WindowTools`` 提供三种取窗口的方式，供 GUI 组合使用：
+
+- :meth:`WindowTools.active_title`   取当前前台窗口（**注意**：在按钮回调里调用只会取到本程序自己）
+- :meth:`WindowTools.list_windows`   枚举桌面上所有可见窗口，用于下拉选择
+- :meth:`WindowTools.window_at_point` 取某个屏幕坐标下最顶层的窗口，用于「鼠标点选」
 """
 
 from __future__ import annotations
@@ -15,7 +21,8 @@ from __future__ import annotations
 import os
 import platform
 import threading
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
 SYSTEM = platform.system()  # "Windows" | "Darwin" | "Linux"
 
@@ -220,14 +227,53 @@ def locate_center(template_path: str, confidence: float = 0.9, grabber: Optional
 # ---------------------------------------------------------------- 窗口工具
 
 
+@dataclass
+class WindowInfo:
+    """一个桌面上可见的顶层窗口。
+
+    ``handle`` 在 win32gui 后端下是真正的 ``HWND``，pygetwindow 后端下为 0；
+    ``process`` 是尽量获取的进程名（拿不到就留空），仅用于下拉列表显示。
+    """
+
+    title: str
+    left: int
+    top: int
+    width: int
+    height: int
+    handle: int = 0
+    process: str = ""
+
+    @property
+    def area(self) -> int:
+        return max(0, self.width) * max(0, self.height)
+
+    def contains(self, x: int, y: int) -> bool:
+        return self.left <= x < self.left + self.width and self.top <= y < self.top + self.height
+
+    def display(self, limit: int = 40) -> str:
+        """下拉列表里的展示文本：进程名 · 裁剪后的标题。"""
+        title = self.title.strip() or "(无标题)"
+        if len(title) > limit:
+            title = title[: limit - 1] + "…"
+        return f"{self.process} · {title}" if self.process else title
+
+
 class WindowTools:
-    """前台窗口检测，按可用性逐级降级：win32gui → pygetwindow → 关闭该功能。"""
+    """窗口枚举与命中检测，按可用性逐级降级：win32gui → pygetwindow → 关闭该功能。
+
+    三种取窗口的方式各有用武之地：
+
+    - :meth:`active_title`——适合在倒计时结束后采样（按钮回调里调用只会读到本程序）；
+    - :meth:`list_windows`——给下拉框用，用户不必手打标题；
+    - :meth:`window_at_point`——配合半透明浮层做「鼠标点选」，最直观。
+    """
 
     backend: str = "none"
 
     def __init__(self) -> None:
         self._win32 = None
         self._pygetwindow = None
+        self._win32process = None
         if SYSTEM == "Windows":
             try:
                 import win32gui  # noqa: F401
@@ -236,6 +282,12 @@ class WindowTools:
                 self.backend = "win32gui"
             except Exception:
                 self._win32 = None
+            try:
+                import win32process  # noqa: F401
+
+                self._win32process = win32process
+            except Exception:
+                self._win32process = None
         if self.backend == "none":
             try:
                 import pygetwindow  # noqa: F401
@@ -244,6 +296,151 @@ class WindowTools:
                 self.backend = "pygetwindow"
             except Exception:
                 self.backend = "none"
+
+    # ------------------------------------------------------------ 枚举 / 命中
+
+    def list_windows(self, include_minimized: bool = False) -> List[WindowInfo]:
+        """枚举桌面上所有可见的顶层窗口（按 Z 序从前往后）。
+
+        无可用后端时返回空列表——调用方据此提示用户手动填写，而不是抛异常。
+        """
+        items: List[WindowInfo] = []
+        if self._win32 is not None:
+            items = self._list_windows_win32(include_minimized)
+        elif self._pygetwindow is not None:
+            items = self._list_windows_pygw(include_minimized)
+        return items
+
+    def _list_windows_win32(self, include_minimized: bool) -> List[WindowInfo]:
+        items: List[WindowInfo] = []
+
+        def _cb(hwnd, _):
+            try:
+                w = self._win32
+                if not w.IsWindowVisible(hwnd):
+                    return True
+                if not include_minimized and w.IsIconic(hwnd):
+                    return True
+                left, top, right, bottom = w.GetWindowRect(hwnd)
+                width, height = right - left, bottom - top
+                # 最小化到任务栏的窗口会被系统挪到坐标 -32000 附近
+                if width <= 1 or height <= 1 or left < -30000 or top < -30000:
+                    return True
+                title = (w.GetWindowText(hwnd) or "").strip()
+                items.append(WindowInfo(title=title, left=left, top=top, width=width,
+                                        height=height, handle=hwnd,
+                                        process=self._win32_process_name(hwnd)))
+            except Exception:
+                pass
+            return True
+
+        try:
+            self._win32.EnumWindows(_cb, None)
+        except Exception:
+            return []
+        return items
+
+    def _list_windows_pygw(self, include_minimized: bool) -> List[WindowInfo]:
+        items: List[WindowInfo] = []
+        try:
+            for win in self._pygetwindow.getAllWindows():
+                try:
+                    title = (win.title or "").strip()
+                    width, height = int(win.width), int(win.height)
+                    left, top = int(win.left), int(win.top)
+                    if width <= 1 or height <= 1 or left < -30000 or top < -30000:
+                        continue
+                    if not include_minimized and title.lower() in ("", "screencapture"):
+                        continue
+                    items.append(WindowInfo(title=title, left=left, top=top,
+                                            width=width, height=height))
+                except Exception:
+                    continue
+        except Exception:
+            return []
+        return items
+
+    def _win32_process_name(self, hwnd: int) -> str:
+        """尽力取进程名，拿不到就返回空串（不影响下拉可用性）。
+
+        刻意只用可选依赖 psutil，不退化到 ``tasklist``——后者每查一个窗口都要
+        起一个子进程，几十个窗口会让下拉刷新卡住好几秒。
+        """
+        if self._win32process is None:
+            return ""
+        try:
+            import psutil
+        except Exception:
+            return ""
+        try:
+            _, pid = self._win32process.GetWindowThreadProcessId(hwnd)
+            if pid:
+                return psutil.Process(pid).name().replace(".exe", "")
+        except Exception:
+            return ""
+        return ""
+
+    def window_at_point(self, x: int, y: int, exclude_handle: int = 0,
+                        exclude_title: str = "") -> Optional[WindowInfo]:
+        """取屏幕坐标 ``(x, y)`` 处最顶层的窗口，自动跳过排除项。
+
+        Windows 下 ``EnumWindows`` 的枚举顺序本身就是 Z 序（最上层在前），
+        因此只要按顺序做矩形命中测试，第一个命中的就是「肉眼看到的那个窗口」，
+        顺带自然跳过了覆盖在上面的半透明选择器浮层。
+        """
+        for info in self.list_windows(include_minimized=True):
+            if info.handle and info.handle == exclude_handle:
+                continue
+            if exclude_title and info.title == exclude_title:
+                continue
+            if info.contains(x, y):
+                return info
+        return None
+
+    def find_by_title(self, title: str) -> Optional[WindowInfo]:
+        """按标题包含匹配（忽略大小写）查找第一个命中的窗口，用于取它的矩形。"""
+        if not title:
+            return None
+        key = title.lower()
+        for info in self.list_windows(include_minimized=True):
+            if key in info.title.lower():
+                return info
+        return None
+
+    def activate(self, title: str) -> Tuple[bool, str]:
+        """把标题包含匹配的窗口切到前台。
+
+        返回 ``(是否成功, 说明)``——失败时说明里给出原因，交给上层提示用户切,
+        而不是抛异常中断任务。
+        """
+        if self.backend == "none":
+            return False, "当前平台不支持窗口枚举，无法自动切换"
+        info = self.find_by_title(title)
+        if info is None:
+            return False, f"桌面上找不到标题包含“{title}”的窗口"
+        try:
+            if self._win32 is not None and info.handle:
+                hwnd = info.handle
+                w = self._win32
+                if w.IsIconic(hwnd):
+                    w.ShowWindow(hwnd, 9)  # SW_RESTORE
+                try:
+                    w.SetForegroundWindow(hwnd)
+                except Exception:
+                    # 系统不允许后台进程抢焦点时退而求其次：先 BringToTop
+                    w.BringWindowToTop(hwnd)
+                    w.SetForegroundWindow(hwnd)
+                return w.GetForegroundWindow() == hwnd, ""
+            if self._pygetwindow is not None:
+                for win in self._pygetwindow.getAllWindows():
+                    if title.lower() in (win.title or "").lower():
+                        win.activate()
+                        return True, ""
+        except Exception as exc:
+            return False, f"切换窗口失败：{exc}"
+        return False, "未能激活目标窗口（可能被系统限制了抢焦点）"
+
+    # ------------------------------------------------------------ 前台
 
     def active_title(self) -> Optional[str]:
         try:
