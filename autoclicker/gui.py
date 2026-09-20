@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import queue
+import sys
 import threading
 import tkinter as tk
 import uuid
@@ -72,11 +73,10 @@ class CoordinatePicker(tk.Toplevel):
             text="移动鼠标到目标位置 —— 按【空格】或单击锁定，【Esc】取消",
             fill="#ffffff", font=("Microsoft YaHei", 16, "bold"), tags=("hint",),
         )
-        if initial_hint:
-            self.canvas.create_text(
-                self.winfo_screenwidth() // 2, 78,
-                text=initial_hint, fill="#ffd479", font=("Microsoft YaHei", 12), tags=("hint",),
-            )
+        self.hint_secondary = self.canvas.create_text(
+            self.winfo_screenwidth() // 2, 78, text=initial_hint or "",
+            fill="#ffd479", font=("Microsoft YaHei", 12), tags=("hint",),
+        )
 
         # 十字线 + 坐标标签，随鼠标移动
         self.cross_v = self.canvas.create_line(0, 0, 0, 0, fill="#ff4d4f", width=1)
@@ -121,13 +121,29 @@ class CoordinatePicker(tk.Toplevel):
         self.canvas.itemconfig(self.label, text=f"{self._last[0]}, {self._last[1]}")
 
     def _tick(self) -> None:
-        """不依赖鼠标事件也能刷新坐标（浮层挡不住底层窗口时使用场景）。"""
+        """不依赖鼠标事件也能刷新坐标（浮层遮住底层窗口时的使用场景）。
+
+        这里的异常**不能静默吞掉**：它每 80ms 跑一次，一旦内部出错，
+        表现就是「坐标一直不动」，用户完全看不出是程序坏了。
+        所以首次出错就把原因写在浮层上，同时送去 stderr。
+        """
         if self.winfo_exists():
             try:
                 self._on_motion()
-            except Exception:
-                pass
+            except Exception as exc:
+                self._report_poll_error(exc)
             self.after(80, self._tick)
+
+    def _report_poll_error(self, exc: Exception) -> None:
+        if getattr(self, "_poll_error_shown", False):
+            return
+        self._poll_error_shown = True
+        text = f"刷新出错：{exc}"
+        sys.stderr.write(f"[CoordinatePicker] {text}\n")
+        try:
+            self.canvas.itemconfig(self.hint_secondary, text=text, fill="#ff7875")
+        except Exception:
+            pass
 
     def _capture(self) -> None:
         try:
@@ -236,9 +252,21 @@ class WindowPicker(tk.Toplevel):
             )
             self._current = info
             self._paint(info)
+        except Exception as exc:
+            self._report_poll_error(exc)
+        self.after(self.POLL_MS, self._tick)
+
+    def _report_poll_error(self, exc: Exception) -> None:
+        """轮询异常要让人看见——静默失效最难排查。"""
+        if getattr(self, "_poll_error_shown", False):
+            return
+        self._poll_error_shown = True
+        text = f"刷新出错：{exc}"
+        sys.stderr.write(f"[WindowPicker] {text}\n")
+        try:
+            self.canvas.itemconfig(self.hint_secondary, text=text, fill="#ff7875")
         except Exception:
             pass
-        self.after(self.POLL_MS, self._tick)
 
     def _paint(self, info) -> None:
         origin_x, origin_y = self._geometry_origin()
@@ -317,7 +345,7 @@ class RegionCapture(tk.Toplevel):
             fill="#ffffff", font=("Microsoft YaHei", 14, "bold"),
         )
         self.canvas.bind("<ButtonPress-1>", self._down)
-        self.canvas.bind("<B1Motion>", self._move)
+        self.canvas.bind("<B1-Motion>", self._move)
         self.canvas.bind("<ButtonRelease-1>", self._up)
         self.bind("<KeyPress-Escape>", lambda e: self._close())
         self.focus_force()
@@ -498,14 +526,34 @@ class StepDialog(tk.Toplevel):
         set_state(self.key_frame, key_ok)
         set_state(self.img_frame, img_ok)
 
+    def _run_offscreen(self, action) -> None:
+        """执行需要「让开屏幕」的操作（拾取坐标 / 框选截图）。
+
+        注意这里必须用 ``withdraw`` 而不是 ``iconify``：本对话框设置了
+        ``transient(master)``，而 Tk 不允许 iconify 一个 transient 窗口，
+        会直接抛 ``can't iconify: it is a transient``——浮层根本来不及弹出。
+        隐藏会连带释放 grab，所以回来后要重建。
+        """
+        self.withdraw()
+        try:
+            action()
+        finally:
+            self.deiconify()
+            try:
+                self.grab_set()
+                self.focus_force()
+                self.lift()
+            except Exception:
+                pass
+
     def _pick(self) -> None:
-        self.iconify()
-        picker = CoordinatePicker(self.master)
-        self.wait_window(picker)
-        self.deiconify()
-        if picker.result:
-            self.v_x.set(picker.result[0])
-            self.v_y.set(picker.result[1])
+        def _do() -> None:
+            picker = CoordinatePicker(self.master)
+            self.wait_window(picker)
+            if picker.result:
+                self.v_x.set(picker.result[0])
+                self.v_y.set(picker.result[1])
+        self._run_offscreen(_do)
 
     def _choose_image(self) -> None:
         paths = filedialog.askopenfilenames(
@@ -516,12 +564,12 @@ class StepDialog(tk.Toplevel):
             self.lb_images.insert("end", p)
 
     def _capture_image(self) -> None:
-        self.iconify()
-        cap = RegionCapture(self.master, self.templates_dir)
-        self.wait_window(cap)
-        self.deiconify()
-        if cap.result:
-            self.lb_images.insert("end", cap.result)
+        def _do() -> None:
+            cap = RegionCapture(self.master, self.templates_dir)
+            self.wait_window(cap)
+            if cap.result:
+                self.lb_images.insert("end", cap.result)
+        self._run_offscreen(_do)
 
     def _remove_image(self) -> None:
         sel = self.lb_images.curselection()
@@ -955,12 +1003,15 @@ class App:
         if self._require_window_tools() is None:
             return
         self.root.iconify()  # 主窗口先收起，避免挡住目标窗口
-        self.root.after(160, lambda: None)
         picker = WindowPicker(self.root)
         try:
             self.root.wait_window(picker)
         finally:
             self.root.deiconify()
+            try:
+                self.root.lift()
+            except Exception:
+                pass
         info = picker.result
         if info is None:
             return
