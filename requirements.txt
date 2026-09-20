@@ -1,0 +1,16 @@
+# 核心依赖（三平台通用）
+pyautogui>=0.9.54
+pillow>=9.0
+
+# 推荐安装
+mss>=9.0                 # 多显示器 / 高分屏截图（强烈建议）
+opencv-python>=4.5       # 图片步骤的相似度匹配（不装则退化为精确匹配）
+pyperclip>=1.8           # 中文输入（剪贴板粘贴）
+
+# 可选
+keyboard>=0.13.5         # 全局热键 F9/F10（Linux 需 root，macOS 需辅助功能权限）
+# pygetwindow：macOS / Linux 上的窗口检测备选（Windows 用内置 pywin32）
+pygetwindow>=0.0.9
+
+# 注意：Windows 用户若导入 win32gui 报错，通常是 pywin32 安装不完整，
+# 可执行：python Scripts/pywin32_postinstall.py -install

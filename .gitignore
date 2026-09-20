@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+build/
+dist/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# 运行时产物
+logs/
+*.log
+
+# 屏幕自助框选生成的模板与个人配置：因人而异，不入库
+# （profiles/example.json 作为模板保留，其余自己新建的配置不入库）
+templates/template_*.png
+profiles/*.json
+!profiles/example.json
+
+# 测试输出
+.pytest_cache/
